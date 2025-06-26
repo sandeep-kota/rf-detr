@@ -45,6 +45,7 @@ from rfdetr.util.drop_scheduler import drop_scheduler
 from rfdetr.util.files import download_file
 from rfdetr.util.get_param_dicts import get_param_dict
 from rfdetr.util.utils import ModelEma, BestMetricHolder, clean_state_dict
+from rfdetr.models.segmentation import MaskHead, PostProcessSegm
 
 if str(os.environ.get("USE_FILE_SYSTEM_SHARING", "False")).lower() in ["true", "1"]:
     import torch.multiprocessing
@@ -73,6 +74,8 @@ def download_pretrain_weights(pretrain_weights: str, redownload=False):
 class Model:
     def __init__(self, **kwargs):
         args = populate_args(**kwargs)
+        self.enable_segmentation = kwargs.get('enable_segmentation', False)
+
         self.resolution = args.resolution
         self.model = build_model(args)
         self.device = torch.device(args.device)
@@ -86,7 +89,7 @@ class Model:
                 print("Failed to load pretrain weights, re-downloading")
                 download_pretrain_weights(args.pretrain_weights, redownload=True)
                 checkpoint = torch.load(args.pretrain_weights, map_location='cpu', weights_only=False)
-
+            
             # Extract class_names from checkpoint if available
             if 'args' in checkpoint and hasattr(checkpoint['args'], 'class_names'):
                 self.class_names = checkpoint['args'].class_names
@@ -142,9 +145,31 @@ class Model:
         self.model = self.model.to(self.device)
         self.criterion, self.postprocessors = build_criterion_and_postprocessors(args)
         self.stop_early = False
-    
+
+        
+        # Initialize the model with segmentation if enabled
+        if self.enable_segmentation:
+            # Add mask head parameters to the model
+            self.model.transformer.decoder.mask_head = MaskHead(
+                hidden_dim=self.model.transformer.d_model,
+                num_channels=kwargs.get('mask_channels', 256)
+            )
+            # Update the criterion for segmentation losses
+            self.criterion.mask_loss_coef = kwargs.get('mask_loss_coef', 1.0)
+            self.criterion.dice_loss_coef = kwargs.get('dice_loss_coef', 1.0)
+            
+            # Update postprocessors to handle masks
+            self.postprocessors["segm"] = PostProcessSegm()
+            self.postprocessors["bbox"] = PostProcessSegm(return_masks=False)
+
     def reinitialize_detection_head(self, num_classes):
         self.model.reinitialize_detection_head(num_classes)
+        # if self.enable_segmentation:
+        #     # Reinitialize the mask head if needed
+        #     self.model.transformer.decoder.mask_head = MaskHead(
+        #         hidden_dim=self.model.transformer.d_model,
+        #         num_channels=getattr(self.model.transformer.decoder, 'mask_channels', 256)
+        #     )
 
     def request_early_stop(self):
         self.stop_early = True

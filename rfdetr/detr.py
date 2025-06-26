@@ -179,10 +179,10 @@ class RFDETR:
             self,
             images: Union[str, Image.Image, np.ndarray, torch.Tensor, List[Union[str, np.ndarray, Image.Image, torch.Tensor]]],
             threshold: float = 0.5,
+            return_masks: bool = None,
             **kwargs,
     ) -> Union[sv.Detections, List[sv.Detections]]:
-        """Performs object detection on the input images and returns bounding box
-        predictions.
+        """Performs object detection and optionally segmentation on the input images.
 
         This method accepts a single image or a list of images in various formats
         (file path, PIL Image, NumPy array, or torch.Tensor). The images should be in
@@ -195,23 +195,18 @@ class RFDETR:
                 as file paths, PIL Images, NumPy arrays, or torch.Tensors.
             threshold (float, optional):
                 The minimum confidence score needed to consider a detected bounding box valid.
+            return_masks (bool, optional):
+                Whether to return segmentation masks. If None, will default to True if segmentation
+                is enabled, False otherwise.
             **kwargs:
                 Additional keyword arguments.
 
         Returns:
             Union[sv.Detections, List[sv.Detections]]: A single or multiple Detections
                 objects, each containing bounding box coordinates, confidence scores,
-                and class IDs.
+                class IDs, and optionally masks.
         """
-        if not self._is_optimized_for_inference and not self._has_warned_about_not_being_optimized_for_inference:
-            logger.warning(
-                "Model is not optimized for inference. "
-                "Latency may be higher than expected. "
-                "You can optimize the model for inference by calling model.optimize_for_inference()."
-            )
-            self._has_warned_about_not_being_optimized_for_inference = True
-
-            self.model.model.eval()
+        self.model.model.eval()
 
         if not isinstance(images, list):
             images = [images]
@@ -250,34 +245,17 @@ class RFDETR:
 
         batch_tensor = torch.stack(processed_images)
 
-        if self._is_optimized_for_inference:
-            if self._optimized_resolution != batch_tensor.shape[2]:
-                # this could happen if someone manually changes self.model.resolution after optimizing the model
-                raise ValueError(f"Resolution mismatch. "
-                                 f"Model was optimized for resolution {self._optimized_resolution}, "
-                                 f"but got {batch_tensor.shape[2]}. "
-                                 "You can explicitly remove the optimized model by calling model.remove_optimized_model().")
-            if self._optimized_has_been_compiled:
-                if self._optimized_batch_size != batch_tensor.shape[0]:
-                    raise ValueError(f"Batch size mismatch. "
-                                     f"Optimized model was compiled for batch size {self._optimized_batch_size}, "
-                                     f"but got {batch_tensor.shape[0]}. "
-                                     "You can explicitly remove the optimized model by calling model.remove_optimized_model(). "
-                                     "Alternatively, you can recompile the optimized model for a different batch size "
-                                     "by calling model.optimize_for_inference(batch_size=<new_batch_size>).")
-
         with torch.inference_mode():
-            if self._is_optimized_for_inference:
-                predictions = self.model.inference_model(batch_tensor.to(dtype=self._optimized_dtype))
-            else:
-                predictions = self.model.model(batch_tensor)
-            if isinstance(predictions, tuple):
-                predictions = {
-                    "pred_logits": predictions[1],
-                    "pred_boxes": predictions[0]
-                }
+            predictions = self.model.model(batch_tensor)
             target_sizes = torch.tensor(orig_sizes, device=self.model.device)
-            results = self.model.postprocessors["bbox"](predictions, target_sizes=target_sizes)
+            
+            # Use segmentation postprocessor if available and requested
+            if hasattr(self.model, 'enable_segmentation') and self.model.enable_segmentation:
+                if return_masks is None:
+                    return_masks = True
+                results = self.model.postprocessors["segm"](predictions, target_sizes=target_sizes, return_masks=return_masks)
+            else:
+                results = self.model.postprocessors["bbox"](predictions, target_sizes=target_sizes)
 
         detections_list = []
         for result in results:
@@ -290,11 +268,18 @@ class RFDETR:
             labels = labels[keep]
             boxes = boxes[keep]
 
-            detections = sv.Detections(
-                xyxy=boxes.float().cpu().numpy(),
-                confidence=scores.float().cpu().numpy(),
-                class_id=labels.cpu().numpy(),
-            )
+            detection_args = {
+                "xyxy": boxes.cpu().numpy(),
+                "confidence": scores.cpu().numpy(),
+                "class_id": labels.cpu().numpy(),
+            }
+            
+            # Add masks if available
+            if "masks" in result:
+                masks = result["masks"][keep]
+                detection_args["mask"] = masks.cpu().numpy()
+                
+            detections = sv.Detections(**detection_args)
             detections_list.append(detections)
 
         return detections_list if len(detections_list) > 1 else detections_list[0]
