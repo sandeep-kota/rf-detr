@@ -128,7 +128,7 @@ class DynamicMaskHead(nn.Module):
             qc = qf.shape[1]                      # number of queries in this chunk
 
             # 1) predict all weights+bias for this chunk
-            params = self.dynamic_layer(qf.view(B*qc, D))
+            params = self.dynamic_layer(qf.reshape(B*qc, D))
             w, b = params.split([self.hidden_dim * C, self.hidden_dim], dim=1)
 
             # 2) reshape to conv weight+ bias
