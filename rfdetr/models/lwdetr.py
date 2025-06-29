@@ -24,6 +24,8 @@ import math
 from typing import Callable
 import torch
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+
 from torch import nn
 
 from rfdetr.util import box_ops
@@ -34,6 +36,116 @@ from rfdetr.util.misc import (NestedTensor, nested_tensor_from_tensor_list,
 from rfdetr.models.backbone import build_backbone
 from rfdetr.models.matcher import build_matcher
 from rfdetr.models.transformer import build_transformer
+
+
+
+# ---------------------------
+# MaskPixelDecoder with 4 upconv layers
+# ---------------------------
+class MaskPixelDecoder(nn.Module):
+    def __init__(self, in_channels: int, feat_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, feat_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(feat_channels)
+        
+        self.upsample1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv2 = nn.Conv2d(feat_channels, feat_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(feat_channels)
+        
+        self.upsample2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv3 = nn.Conv2d(feat_channels, feat_channels, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(feat_channels)
+        
+        # self.upsample3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        # self.conv4 = nn.Conv2d(feat_channels, feat_channels, kernel_size=3, padding=1)
+        # self.bn4 = nn.BatchNorm2d(feat_channels)
+        
+        # self.upsample4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        # self.conv5 = nn.Conv2d(feat_channels, feat_channels, kernel_size=3, padding=1)
+        # self.bn5 = nn.BatchNorm2d(feat_channels)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        
+        x = self.upsample1(x)
+        x = F.relu(self.bn2(self.conv2(x)))
+        
+        x = self.upsample2(x)
+        x = F.relu(self.bn3(self.conv3(x)))
+        
+        # x = self.upsample3(x)
+        # x = F.relu(self.bn4(self.conv4(x)))
+        
+        # x = self.upsample4(x)
+        # x = F.relu(self.bn5(self.conv5(x)))
+        
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+
+        return x
+    
+
+# ---------------------------
+# DynamicMaskHead
+# ---------------------------
+class DynamicMaskHead(nn.Module):
+    def __init__(self, query_dim, feat_channels, num_layers=3, hidden_dim=256):
+        """
+        Args:
+            query_dim: dimension of query embeddings (from transformer decoder)
+            feat_channels: channels in pixel features (from pixel decoder)
+            num_layers: number of conv layers in mask head
+            hidden_dim: hidden channel size for conv layers
+        """
+        super().__init__()
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+
+        # Generate dynamic conv weights and biases from query embedding
+        # Typically a linear layer predicts conv weights and biases
+        # For simplicity, we do 1x1 convs here
+        self.dynamic_layer = nn.Linear(query_dim, hidden_dim * feat_channels + hidden_dim)  # weights + bias
+
+        # Subsequent conv layers after dynamic conv
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                nn.GroupNorm(8, hidden_dim),
+                nn.ReLU(inplace=True)
+            ) for _ in range(num_layers - 1)
+        ])
+
+        # Final conv layer outputs mask logits (1 channel)
+        self.final_conv = nn.Conv2d(hidden_dim, 1, kernel_size=1)
+
+    def forward(self, pixel_features, query_feats):
+        B, Q, D = query_feats.shape
+        batch_size, feat_channels, H, W = pixel_features.shape
+
+        query_feats_flat = query_feats.view(B * Q, D)
+
+        # Predict all weights and biases
+        params = self.dynamic_layer(query_feats_flat)
+
+        weight_params = params[:, :self.hidden_dim * feat_channels]
+        bias_params = params[:, self.hidden_dim * feat_channels:]
+
+        # Reshape weight and bias for grouped conv
+        weight = weight_params.reshape(B * Q * self.hidden_dim, feat_channels, 1, 1)
+        bias = bias_params.reshape(B * Q * self.hidden_dim)
+
+        # Repeat pixel features for each query
+        pixel_features_exp = pixel_features.unsqueeze(1).repeat(1, Q, 1, 1, 1)
+        pixel_features_exp = pixel_features_exp.view(B * Q, feat_channels, H, W)
+
+        # Perform grouped conv:
+        x = F.conv2d(pixel_features_exp, weight, bias=bias, groups=B * Q)
+
+        # Apply additional convs if you have (not shown here)
+
+        # Output masks: reshape to (B, Q, H, W)
+        masks = x.view(B, Q, H, W)
+        return masks
+    
 
 class LWDETR(nn.Module):
     """ This is the Group DETR v3 module that performs object detection """
@@ -68,6 +180,10 @@ class LWDETR(nn.Module):
         query_dim=4
         self.refpoint_embed = nn.Embedding(num_queries * group_detr, query_dim)
         self.query_feat = nn.Embedding(num_queries * group_detr, hidden_dim)
+        
+        self.mask_pixel_decoder = MaskPixelDecoder(in_channels=hidden_dim, feat_channels=hidden_dim )
+        self.mask_head = DynamicMaskHead(query_dim=hidden_dim, feat_channels=hidden_dim)
+
         nn.init.constant_(self.refpoint_embed.weight.data, 0)
 
         self.backbone = backbone
@@ -189,6 +305,11 @@ class LWDETR(nn.Module):
                 cls_enc.append(cls_enc_gidx)
             cls_enc = torch.cat(cls_enc, dim=1)
             out['enc_outputs'] = {'pred_logits': cls_enc, 'pred_boxes': ref_enc}
+        
+        mask_feats = self.mask_pixel_decoder(srcs[0])
+        mask_logits = self.mask_head(mask_feats, hs[-1])
+        out['pred_masks'] = mask_logits
+
         return out
 
     def forward_export(self, tensors):
@@ -403,6 +524,29 @@ class SetCriterion(nn.Module):
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
+    def loss_masks(self, outputs, targets, indices, num_boxes):
+        """Mask loss (sigmoid BCE + dice loss)"""
+        src_idx = self._get_src_permutation_idx(indices)
+        tgt_idx = self._get_tgt_permutation_idx(indices)
+        src_masks = outputs['pred_masks'][src_idx]  # (sum of matched queries, H, W)
+        target_masks = torch.cat([t['masks'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        # Resize target masks to predicted mask size if needed
+        src_masks = src_masks.flatten(1)
+        target_masks = target_masks.flatten(1).to(src_masks.dtype)
+
+        loss_bce = F.binary_cross_entropy_with_logits(src_masks, target_masks, reduction='mean')
+
+        # Dice loss
+        probs = src_masks.sigmoid()
+        intersection = (probs * target_masks).sum(1)
+        cardinality = probs.sum(1) + target_masks.sum(1)
+        loss_dice = 1 - (2 * intersection + 1) / (cardinality + 1)
+
+        loss_dice = loss_dice.mean()
+
+        return {'loss_mask_bce': loss_bce, 'loss_mask_dice': loss_dice}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -420,6 +564,7 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels,
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
+            'masks': self.loss_masks
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -546,6 +691,7 @@ class PostProcess(nn.Module):
                           For visualization, this should be the image size after data augment, but before padding
         """
         out_logits, out_bbox = outputs['pred_logits'], outputs['pred_boxes']
+        out_masks = outputs.get('pred_masks', None)  # optional
 
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
@@ -563,7 +709,34 @@ class PostProcess(nn.Module):
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
 
-        results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
+        # results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
+        results = []
+        batch_size = out_logits.shape[0]
+
+        for i in range(batch_size):
+            result = {
+                'scores': scores[i],
+                'labels': labels[i],
+                'boxes': boxes[i],
+            }
+
+            if out_masks is not None:
+                masks = out_masks[i]           # (num_queries_total, H_mask, W_mask)
+                selected_masks = masks[topk_indexes[i]]  # (num_outputs, H_mask, W_mask)
+                selected_masks = selected_masks.sigmoid() > 0.5   # binarize masks
+
+                # Resize masks from mask resolution to original image size
+                # out_masks spatial size could be smaller than input image size, so resize accordingly
+                resized_masks = []
+                H_orig, W_orig = img_h[i].item(), img_w[i].item()
+                for m in selected_masks:
+                    m_pil = TF.to_pil_image(m.float().cpu())
+                    m_resized = TF.resize(m_pil, (H_orig, W_orig), interpolation=TF.InterpolationMode.NEAREST)
+                    resized_masks.append(torch.as_tensor(m_resized, device=m.device, dtype=torch.uint8))
+
+                # Stack masks back (num_outputs, H_orig, W_orig)
+                result['masks'] = torch.stack(resized_masks).to(torch.bool)
+            results.append(result)
 
         return results
 
@@ -652,7 +825,7 @@ def build_criterion_and_postprocessors(args):
             aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'cardinality']
+    losses = ['labels', 'boxes', 'cardinality', 'masks']
 
     try:
         sum_group_losses = args.sum_group_losses
