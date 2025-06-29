@@ -30,6 +30,7 @@ class ModelConfig(BaseModel):
     resolution: int = 560
     group_detr: int = 13
     gradient_checkpointing: bool = False
+    enable_segmentation: bool = False
 
 class RFDETRBaseConfig(ModelConfig):
     encoder: Literal["dinov2_windowed_small", "dinov2_windowed_base"] = "dinov2_windowed_small"

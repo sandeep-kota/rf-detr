@@ -84,68 +84,98 @@ class MaskPixelDecoder(nn.Module):
         return x
     
 
-# ---------------------------
-# DynamicMaskHead
-# ---------------------------
 class DynamicMaskHead(nn.Module):
-    def __init__(self, query_dim, feat_channels, num_layers=3, hidden_dim=256):
-        """
-        Args:
-            query_dim: dimension of query embeddings (from transformer decoder)
-            feat_channels: channels in pixel features (from pixel decoder)
-            num_layers: number of conv layers in mask head
-            hidden_dim: hidden channel size for conv layers
-        """
+    def __init__(
+        self,
+        query_dim,
+        feat_channels,
+        num_layers=3,
+        hidden_dim=256,
+        chunk_size: int = 16,
+    ):
         super().__init__()
-        self.num_layers = num_layers
         self.hidden_dim = hidden_dim
+        self.chunk_size = chunk_size
 
-        # Generate dynamic conv weights and biases from query embedding
-        # Typically a linear layer predicts conv weights and biases
-        # For simplicity, we do 1x1 convs here
-        self.dynamic_layer = nn.Linear(query_dim, hidden_dim * feat_channels + hidden_dim)  # weights + bias
+        # per‐query 1×1 conv weights + biases
+        self.dynamic_layer = nn.Linear(
+            query_dim,
+            hidden_dim * feat_channels + hidden_dim
+        )
 
-        # Subsequent conv layers after dynamic conv
+        # extra conv layers
         self.convs = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
                 nn.GroupNorm(8, hidden_dim),
                 nn.ReLU(inplace=True)
-            ) for _ in range(num_layers - 1)
+            )
+            for _ in range(num_layers - 1)
         ])
 
-        # Final conv layer outputs mask logits (1 channel)
-        self.final_conv = nn.Conv2d(hidden_dim, 1, kernel_size=1)
+        # final 1×1 conv
+        self.final_conv = nn.Conv2d(hidden_dim, 1, 1)
 
     def forward(self, pixel_features, query_feats):
-        B, Q, D = query_feats.shape
-        batch_size, feat_channels, H, W = pixel_features.shape
+        """
+        pixel_features: (B, C, H, W)
+        query_feats:    (B, Q, D)
+        """
+        B, C, H, W = pixel_features.shape
+        _, Q, D    = query_feats.shape
 
-        query_feats_flat = query_feats.view(B * Q, D)
+        def _proc(qf):
+            qc = qf.shape[1]                      # number of queries in this chunk
 
-        # Predict all weights and biases
-        params = self.dynamic_layer(query_feats_flat)
+            # 1) predict all weights+bias for this chunk
+            params = self.dynamic_layer(qf.view(B*qc, D))
+            w, b = params.split([self.hidden_dim * C, self.hidden_dim], dim=1)
 
-        weight_params = params[:, :self.hidden_dim * feat_channels]
-        bias_params = params[:, self.hidden_dim * feat_channels:]
+            # 2) reshape to conv weight+ bias
+            #    weight: (B*qc*hidden_dim, C, 1, 1)
+            #    bias:   (B*qc*hidden_dim)
+            weight = w.reshape(B*qc*self.hidden_dim, C, 1, 1)
+            bias   = b.reshape(B*qc*self.hidden_dim)
 
-        # Reshape weight and bias for grouped conv
-        weight = weight_params.reshape(B * Q * self.hidden_dim, feat_channels, 1, 1)
-        bias = bias_params.reshape(B * Q * self.hidden_dim)
+            # 3) prepare pixel_features chunk:
+            #    expand → (B, qc, C, H, W) view (no copy)
+            #    → reshape to (B*qc, C, H, W)
+            pf = (pixel_features
+                    .unsqueeze(1)
+                    .expand(-1, qc, -1, -1, -1)
+                    .contiguous()
+                    .view(B*qc, C, H, W)
+                 )
 
-        # Repeat pixel features for each query
-        pixel_features_exp = pixel_features.unsqueeze(1).repeat(1, Q, 1, 1, 1)
-        pixel_features_exp = pixel_features_exp.view(B * Q, feat_channels, H, W)
+            # 4) fold batch into channel dim:
+            #    pf2: (1, B*qc*C, H, W)
+            pf2 = pf.view(1, B*qc*C, H, W)
 
-        # Perform grouped conv:
-        x = F.conv2d(pixel_features_exp, weight, bias=bias, groups=B * Q)
+            # 5) single grouped conv across those folded channels:
+            #    groups = B*qc
+            out = F.conv2d(pf2, weight, bias=bias, groups=B*qc)
 
-        # Apply additional convs if you have (not shown here)
+            # 6) unfold back to (B*qc, hidden_dim, H, W)
+            out = out.view(B*qc, self.hidden_dim, H, W)
 
-        # Output masks: reshape to (B, Q, H, W)
-        masks = x.view(B, Q, H, W)
-        return masks
-    
+            # 7) additional conv layers
+            for conv in self.convs:
+                out = conv(out)
+
+            # 8) final 1×1 conv → (B*qc, 1, H, W)
+            out = self.final_conv(out)
+
+            # 9) reshape → (B, qc, H, W)
+            return out.view(B, qc, H, W)
+
+        # split into manageable chunks
+        if Q <= self.chunk_size:
+            return _proc(query_feats)
+        masks = []
+        for i in range(0, Q, self.chunk_size):
+            masks.append(_proc(query_feats[:, i : i + self.chunk_size]))
+        return torch.cat(masks, dim=1)  # (B, Q, H, W)
+
 
 class LWDETR(nn.Module):
     """ This is the Group DETR v3 module that performs object detection """
@@ -158,7 +188,8 @@ class LWDETR(nn.Module):
                  group_detr=1,
                  two_stage=False,
                  lite_refpoint_refine=False,
-                 bbox_reparam=False):
+                 bbox_reparam=False,
+                 enable_segmentation=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -176,13 +207,15 @@ class LWDETR(nn.Module):
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-
+        self.enable_segmentation = enable_segmentation
+        
         query_dim=4
         self.refpoint_embed = nn.Embedding(num_queries * group_detr, query_dim)
         self.query_feat = nn.Embedding(num_queries * group_detr, hidden_dim)
         
-        self.mask_pixel_decoder = MaskPixelDecoder(in_channels=hidden_dim, feat_channels=hidden_dim )
-        self.mask_head = DynamicMaskHead(query_dim=hidden_dim, feat_channels=hidden_dim)
+        if self.enable_segmentation:
+            self.mask_pixel_decoder = MaskPixelDecoder(in_channels=hidden_dim, feat_channels=hidden_dim )
+            self.mask_head = DynamicMaskHead(query_dim=hidden_dim, feat_channels=hidden_dim)
 
         nn.init.constant_(self.refpoint_embed.weight.data, 0)
 
@@ -306,9 +339,10 @@ class LWDETR(nn.Module):
             cls_enc = torch.cat(cls_enc, dim=1)
             out['enc_outputs'] = {'pred_logits': cls_enc, 'pred_boxes': ref_enc}
         
-        mask_feats = self.mask_pixel_decoder(srcs[0])
-        mask_logits = self.mask_head(mask_feats, hs[-1])
-        out['pred_masks'] = mask_logits
+        if self.enable_segmentation:
+            mask_feats = self.mask_pixel_decoder(srcs[0])
+            mask_logits = self.mask_head(mask_feats, hs[-1])
+            out['pred_masks'] = mask_logits
 
         return out
 
@@ -374,7 +408,8 @@ class SetCriterion(nn.Module):
                  sum_group_losses=False,
                  use_varifocal_loss=False,
                  use_position_supervised_loss=False,
-                 ia_bce_loss=False,):
+                 ia_bce_loss=False,
+                 enable_segmentation=False):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -395,6 +430,7 @@ class SetCriterion(nn.Module):
         self.use_varifocal_loss = use_varifocal_loss
         self.use_position_supervised_loss = use_position_supervised_loss
         self.ia_bce_loss = ia_bce_loss
+        self.enable_segmentation = enable_segmentation
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss)
@@ -564,8 +600,9 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels,
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
-            'masks': self.loss_masks
         }
+        if self.enable_segmentation:
+            loss_map['masks'] = self.loss_masks
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
@@ -808,6 +845,7 @@ def build_model(args):
         two_stage=args.two_stage,
         lite_refpoint_refine=args.lite_refpoint_refine,
         bbox_reparam=args.bbox_reparam,
+        enable_segmentation=args.enable_segmentation,
     )
     return model
 
@@ -825,7 +863,9 @@ def build_criterion_and_postprocessors(args):
             aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'cardinality', 'masks']
+    losses = ['labels', 'boxes', 'cardinality']
+    if args.enable_segmentation:
+        losses.append('masks')
 
     try:
         sum_group_losses = args.sum_group_losses
