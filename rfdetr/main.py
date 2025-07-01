@@ -650,23 +650,27 @@ def get_args_parser():
                         help='gradient clipping max norm')
     parser.add_argument('--lr_vit_layer_decay', default=0.8, type=float)
     parser.add_argument('--lr_component_decay', default=1.0, type=float)
-    parser.add_argument('--do_benchmark', action='store_true', help='benchmark the model')
 
-    # drop args 
-    # dropout and stochastic depth drop rate; set at most one to non-zero
-    parser.add_argument('--dropout', type=float, default=0,
-                        help='Drop path rate (default: 0.0)')
-    parser.add_argument('--drop_path', type=float, default=0,
-                        help='Drop path rate (default: 0.0)')
+    # segmentation
+    parser.add_argument('--enable_segmentation', action='store_true',
+                        help='Enable lightweight segmentation head for mask prediction')
 
-    # early / late dropout and stochastic depth settings
-    parser.add_argument('--drop_mode', type=str, default='standard',
-                        choices=['standard', 'early', 'late'], help='drop mode')
-    parser.add_argument('--drop_schedule', type=str, default='constant',
+    # Do benchmark
+    parser.add_argument('--do_benchmark', default=False, type=bool)
+
+    # * Drop Schedule
+    parser.add_argument('--dropout', default=0, type=float,
+                        help="Dropout applied in the transformer")
+    parser.add_argument('--drop_path', default=0, type=float,
+                        help="Stochastic depth rate")
+    parser.add_argument('--drop_mode', default='standard', type=str,
+                        choices=['standard', 'linear'],
+                        help='drop mode')
+    parser.add_argument('--drop_schedule', default='constant', type=str,
                         choices=['constant', 'linear'],
-                        help='drop schedule for early dropout / s.d. only')
-    parser.add_argument('--cutoff_epoch', type=int, default=0,
-                        help='if drop_mode is early / late, this is the epoch where dropout ends / starts')
+                        help='drop schedule')
+    parser.add_argument('--cutoff_epoch', default=0, type=int,
+                        help='cutoff_epoch')
 
     # Model parameters
     parser.add_argument('--pretrained_encoder', type=str, default=None, 
@@ -881,6 +885,9 @@ def populate_args(
     bbox_reparam=False,
     freeze_batch_norm=False,
     
+    # Segmentation parameters
+    enable_segmentation=False,
+    
     # Matcher parameters
     set_cost_class=2,
     set_cost_bbox=5,
@@ -994,6 +1001,7 @@ def populate_args(
         decoder_norm=decoder_norm,
         bbox_reparam=bbox_reparam,
         freeze_batch_norm=freeze_batch_norm,
+        enable_segmentation=enable_segmentation,
         set_cost_class=set_cost_class,
         set_cost_bbox=set_cost_bbox,
         set_cost_giou=set_cost_giou,

@@ -46,7 +46,8 @@ class LWDETR(nn.Module):
                  group_detr=1,
                  two_stage=False,
                  lite_refpoint_refine=False,
-                 bbox_reparam=False):
+                 bbox_reparam=False,
+                 enable_segmentation=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -57,6 +58,7 @@ class LWDETR(nn.Module):
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
             group_detr: Number of groups to speed detr training. Default is 1.
             lite_refpoint_refine: TODO
+            enable_segmentation: True if segmentation head should be added for mask prediction
         """
         super().__init__()
         self.num_queries = num_queries
@@ -64,6 +66,12 @@ class LWDETR(nn.Module):
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+
+        # Lightweight segmentation head
+        self.enable_segmentation = enable_segmentation
+        if enable_segmentation:
+            # Lightweight mask head with minimal parameters for edge deployment
+            self.mask_head = LightweightMaskHead(hidden_dim, hidden_dim // 4)
 
         query_dim=4
         self.refpoint_embed = nn.Embedding(num_queries * group_detr, query_dim)
@@ -138,6 +146,8 @@ class LWDETR(nn.Module):
                                (center_x, center_y, width, height). These values are normalized in [0, 1],
                                relative to the size of each individual image (disregarding possible padding).
                                See PostProcess for information on how to retrieve the unnormalized bounding box.
+               - "pred_masks": Optional, only returned when segmentation is enabled. Predicted masks for all queries.
+                               Shape= [batch_size x num_queries x H x W]
                - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
                                 dictionnaries containing the two above keys for each decoder layer.
         """
@@ -147,7 +157,7 @@ class LWDETR(nn.Module):
 
         srcs = []
         masks = []
-        for l, feat in enumerate(features):
+        for level, feat in enumerate(features):
             src, mask = feat.decompose()
             srcs.append(src)
             masks.append(mask)
@@ -177,8 +187,24 @@ class LWDETR(nn.Module):
         outputs_class = self.class_embed(hs)
 
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        
+        # Add segmentation predictions if enabled
+        if self.enable_segmentation:
+            # Use the last decoder layer features and the highest resolution backbone feature
+            decoder_features = hs[-1]  # [B, N, hidden_dim]
+            backbone_features = srcs[0]  # Use highest resolution feature map
+            pred_masks = self.mask_head(decoder_features, backbone_features)
+            out['pred_masks'] = pred_masks
+        
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+            aux_outputs = self._set_aux_loss(outputs_class, outputs_coord)
+            # Add mask predictions to auxiliary outputs if segmentation is enabled
+            if self.enable_segmentation:
+                for i, aux_out in enumerate(aux_outputs):
+                    decoder_features_aux = hs[i]
+                    pred_masks_aux = self.mask_head(decoder_features_aux, backbone_features)
+                    aux_out['pred_masks'] = pred_masks_aux
+            out['aux_outputs'] = aux_outputs
 
         if self.two_stage:
             group_detr = self.group_detr if self.training else 1
@@ -210,6 +236,14 @@ class LWDETR(nn.Module):
         else:
             outputs_coord = (self.bbox_embed(hs) + ref_unsigmoid).sigmoid()
         outputs_class = self.class_embed(hs)
+        
+        # Add segmentation predictions for export if enabled
+        if self.enable_segmentation:
+            decoder_features = hs[-1]  # [B, N, hidden_dim]
+            backbone_features = srcs[0]  # Use highest resolution feature map
+            pred_masks = self.mask_head(decoder_features, backbone_features)
+            return outputs_coord, outputs_class, pred_masks
+        
         return outputs_coord, outputs_class
 
     @torch.jit.unused
@@ -568,6 +602,118 @@ class PostProcess(nn.Module):
         return results
 
 
+class LightweightMaskHead(nn.Module):
+    """
+    Lightweight segmentation head optimized for edge deployment.
+    Uses minimal parameters while maintaining good performance.
+    """
+    def __init__(self, hidden_dim, mask_dim):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.mask_dim = mask_dim
+        
+        # Lightweight mask projection - single linear layer to keep parameters low
+        self.mask_embed = nn.Linear(hidden_dim, mask_dim)
+        
+        # More memory-efficient upsampling path with fewer parameters
+        self.mask_head = nn.Sequential(
+            # Start with a regular conv to expand channels
+            nn.Conv2d(1, mask_dim // 2, 3, padding=1),  # Reduced channels
+            nn.ReLU(inplace=True),
+            
+            # Single upsampling step to reduce memory
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(mask_dim // 2, mask_dim // 4, 3, padding=1),  # Further reduce
+            nn.ReLU(inplace=True),
+            
+            # Final output layer
+            nn.Conv2d(mask_dim // 4, 1, 3, padding=1),
+        )
+        
+        # Initialize weights
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, decoder_features, backbone_features):
+        """
+        Args:
+            decoder_features: [B, N, hidden_dim] - features from decoder queries
+            backbone_features: [B, C, H, W] - features from backbone for spatial info
+        Returns:
+            masks: [B, N, H, W] - predicted masks for each query
+        """
+        B, N, _ = decoder_features.shape
+        _, C, H, W = backbone_features.shape
+        
+        # Project decoder features to mask embedding space
+        mask_embeddings = self.mask_embed(decoder_features)  # [B, N, mask_dim]
+        
+        # More aggressive downsampling for memory efficiency
+        target_h, target_w = max(H // 4, 8), max(W // 4, 8)  # Ensure minimum size
+        backbone_resized = F.interpolate(
+            backbone_features, 
+            size=(target_h, target_w),
+            mode='bilinear', 
+            align_corners=False
+        )
+        
+        # Process in smaller batches to reduce memory usage
+        batch_size = min(N, 8)  # Process max 8 queries at once
+        masks = []
+        
+        for start_idx in range(0, N, batch_size):
+            end_idx = min(start_idx + batch_size, N)
+            batch_masks = []
+            
+            for i in range(start_idx, end_idx):
+                query_embed = mask_embeddings[:, i, :]  # [B, mask_dim]
+                
+                # Create spatial mask by broadcasting query embedding
+                query_spatial = query_embed.view(B, self.mask_dim, 1, 1).expand(-1, -1, target_h, target_w)
+                
+                # Take subset of backbone channels for compatibility
+                num_channels = min(self.mask_dim, C)
+                backbone_channels = backbone_resized[:, :num_channels, :, :]
+                
+                # If we need more channels, pad with zeros instead of repeating
+                if num_channels < self.mask_dim:
+                    padding = torch.zeros(B, self.mask_dim - num_channels, target_h, target_w, 
+                                        device=backbone_channels.device, dtype=backbone_channels.dtype)
+                    backbone_channels = torch.cat([backbone_channels, padding], dim=1)
+                
+                # Element-wise multiplication and sum across channels
+                mask_logits = (query_spatial * backbone_channels).sum(dim=1, keepdim=True)  # [B, 1, H, W]
+                
+                # Apply lightweight upsampling head
+                with torch.cuda.amp.autocast(enabled=False):  # Disable autocast for upsampling
+                    mask = self.mask_head(mask_logits.float())  # [B, 1, H, W]
+                
+                batch_masks.append(mask.squeeze(1))  # [B, H, W]
+                
+                # Clear intermediate tensors to free memory
+                del query_spatial, backbone_channels, mask_logits, mask
+            
+            masks.extend(batch_masks)
+            
+            # Force garbage collection for large batches
+            if len(batch_masks) >= 4:
+                torch.cuda.empty_cache()
+        
+        masks = torch.stack(masks, dim=1)  # [B, N, H, W]
+        
+        # Final resize to match expected output size if needed
+        if masks.shape[-2] != H or masks.shape[-1] != W:
+            masks = F.interpolate(masks, size=(H, W), mode='bilinear', align_corners=False)
+        
+        return masks
+
+
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
 
@@ -625,6 +771,9 @@ def build_model(args):
     args.num_feature_levels = len(args.projector_scale)
     transformer = build_transformer(args)
 
+    # Check if segmentation is enabled
+    enable_segmentation = getattr(args, 'enable_segmentation', False)
+
     model = LWDETR(
         backbone,
         transformer,
@@ -635,6 +784,7 @@ def build_model(args):
         two_stage=args.two_stage,
         lite_refpoint_refine=args.lite_refpoint_refine,
         bbox_reparam=args.bbox_reparam,
+        enable_segmentation=enable_segmentation,
     )
     return model
 
